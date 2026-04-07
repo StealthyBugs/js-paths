@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TCF CMP Stub postMessage PoC</title>
+    <style>
+        body { font-family: monospace; margin: 20px; background: #1a1a2e; color: #0f0; }
+        #log { white-space: pre-wrap; border: 1px solid #333; padding: 10px; background: #000; }
+        iframe { width: 800px; height: 200px; border: 1px solid #333; display: block; margin: 10px 0; }
+        h2 { color: #e94560; }
+        .warn { color: #ff0; }
+        .info { color: #0ff; }
+        .fail { color: #f00; }
+        .ok { color: #0f0; }
+    </style>
+</head>
+<body>
+    <h2>TCF v2.0 CMP Stub - postMessage Probe PoC</h2>
+    <p class="warn">NOTE: The stub's origin check uses an empty array as the allowlist.
+    All cross-origin postMessages are REJECTED (ccJsPostMessageRequestUnauthorized).
+    This PoC demonstrates the protocol and logs any responses received.</p>
+
+    <div id="log"></div>
+    <iframe id="target" src="about:blank"></iframe>
+
+    <script>
+    const logEl = document.getElementById('log');
+    function log(msg, cls) {
+        const span = document.createElement('span');
+        span.className = cls || '';
+        span.textContent = '[' + new Date().toISOString() + '] ' + msg + '\n';
+        logEl.appendChild(span);
+    }
+
+    // ------------------------------------------------------------------
+    // 1. Listen for __tcfapiReturn responses from any frame
+    // ------------------------------------------------------------------
+    window.addEventListener('message', function(event) {
+        log('RECEIVED postMessage from origin: ' + event.origin, 'ok');
+
+        let data = event.data;
+        if (typeof data === 'string') {
+            try { data = JSON.parse(data); } catch(e) {}
+        }
+
+        if (data && data.__tcfapiReturn) {
+            const ret = data.__tcfapiReturn;
+            log('__tcfapiReturn received:', 'ok');
+            log('  callId:      ' + ret.callId, 'info');
+            log('  success:     ' + ret.success, 'info');
+            log('  returnValue: ' + JSON.stringify(ret.returnValue, null, 2), 'info');
+
+            // Specific fields of interest
+            if (ret.returnValue) {
+                const rv = ret.returnValue;
+                log('--- Disclosed Data Fields ---', 'ok');
+                log('  gdprApplies:    ' + rv.gdprApplies, 'info');
+                log('  cmpLoaded:      ' + rv.cmpLoaded, 'info');
+                log('  cmpStatus:      ' + rv.cmpStatus, 'info');
+                log('  displayStatus:  ' + rv.displayStatus, 'info');
+                log('  apiVersion:     ' + rv.apiVersion, 'info');
+                log('  tcString:       ' + (rv.tcString || 'NOT PRESENT'), 'info');
+                log('  cmpId:          ' + (rv.cmpId || 'NOT PRESENT'), 'info');
+                log('  vendorConsents: ' + (rv.purpose ? JSON.stringify(rv.purpose) : 'NOT PRESENT'), 'info');
+            }
+        } else {
+            log('Non-TCF message: ' + JSON.stringify(data).substring(0, 200), 'warn');
+        }
+    });
+
+    // ------------------------------------------------------------------
+    // 2. Send __tcfapiCall messages to the target iframe
+    // ------------------------------------------------------------------
+    function sendTcfCall(targetWindow, command, version, callId, parameter) {
+        // TCF spec: can send as object or JSON string
+        const msg = {
+            __tcfapiCall: {
+                command: command,
+                version: version,
+                callId: callId,
+                parameter: parameter || null
+            }
+        };
+
+        log('SENDING __tcfapiCall: command=' + command + ', version=' + version + ', callId=' + callId, 'info');
+
+        // Send as object
+        try {
+            targetWindow.postMessage(msg, '*');
+        } catch(e) {
+            log('postMessage (object) failed: ' + e.message, 'fail');
+        }
+
+        // Also send as JSON string (the stub handles both formats)
+        try {
+            targetWindow.postMessage(JSON.stringify(msg), '*');
+        } catch(e) {
+            log('postMessage (string) failed: ' + e.message, 'fail');
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Probe sequence
+    // ------------------------------------------------------------------
+    function runProbe(targetWindow) {
+        log('=== Starting TCF CMP Stub Probe ===', 'ok');
+        log('Target origin: (cross-origin Amazon page)', 'info');
+        log('Expected: All requests BLOCKED by empty origin allowlist', 'warn');
+        log('', '');
+
+        // "ping" - the only command the stub answers directly
+        sendTcfCall(targetWindow, 'ping', 2, 'probe-ping-1');
+
+        // "getTCData" - would be queued, not answered by stub
+        setTimeout(function() {
+            sendTcfCall(targetWindow, 'getTCData', 2, 'probe-getTCData-1');
+        }, 500);
+
+        // "addEventListener" - would be queued
+        setTimeout(function() {
+            sendTcfCall(targetWindow, 'addEventListener', 2, 'probe-addEventListener-1');
+        }, 1000);
+
+        // "getVendorList" - would be queued
+        setTimeout(function() {
+            sendTcfCall(targetWindow, 'getVendorList', 2, 'probe-getVendorList-1');
+        }, 1500);
+
+        // Wrong version test
+        setTimeout(function() {
+            sendTcfCall(targetWindow, 'ping', 1, 'probe-wrongver-1');
+        }, 2000);
+
+        // Null version test (should be accepted per stub logic)
+        setTimeout(function() {
+            sendTcfCall(targetWindow, 'ping', null, 'probe-nullver-1');
+        }, 2500);
+
+        setTimeout(function() {
+            log('', '');
+            log('=== Probe complete. If no __tcfapiReturn received, ===', 'warn');
+            log('=== the origin allowlist blocked all requests.     ===', 'warn');
+            log('', '');
+            log('The stub origin check does: d.indexOf(e.origin)', 'info');
+            log('where d = [] (empty command queue array).', 'info');
+            log('indexOf on [] always returns -1, so ALL cross-origin', 'info');
+            log('requests are rejected as ccJsPostMessageRequestUnauthorized.', 'info');
+        }, 4000);
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Load target page in iframe
+    //    NOTE: Amazon sets X-Frame-Options / CSP frame-ancestors,
+    //    so this may be blocked by the browser entirely.
+    //    In a real scenario, the attacker page would be embedded
+    //    on Amazon's domain (e.g., via an XSS or ad iframe).
+    // ------------------------------------------------------------------
+    log('Loading Amazon target page in iframe...', 'info');
+    log('NOTE: Amazon likely blocks framing via X-Frame-Options.', 'warn');
+
+    const iframe = document.getElementById('target');
+    iframe.src = 'https://www.amazon.com/';
+
+    iframe.onload = function() {
+        log('iframe onload fired', 'info');
+        try {
+            // Try to access contentWindow (will work even cross-origin for postMessage)
+            runProbe(iframe.contentWindow);
+        } catch(e) {
+            log('Cannot access iframe contentWindow: ' + e.message, 'fail');
+        }
+    };
+
+    iframe.onerror = function() {
+        log('iframe failed to load (likely X-Frame-Options block)', 'fail');
+        log('In real attack: attacker must be on same origin or in ad iframe', 'warn');
+    };
+
+    // Fallback: try window.open
+    setTimeout(function() {
+        log('', '');
+        log('=== Alternative: window.open approach ===', 'info');
+        log('An attacker could use window.open to get a reference:', 'info');
+        log('  var w = window.open("https://www.amazon.com/");', 'info');
+        log('  w.postMessage({__tcfapiCall: {command:"ping",version:2,callId:"x"}}, "*");', 'info');
+        log('But the stub still blocks due to empty origin allowlist.', 'warn');
+    }, 5000);
+    </script>
+</body>
+</html>
